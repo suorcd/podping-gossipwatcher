@@ -1,0 +1,19 @@
+FROM debian:trixie-slim
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /data/gossip /opt/podping-gossipwatcher \
+    && chown -R 1000:1000 /data /opt/podping-gossipwatcher
+
+WORKDIR /opt/podping-gossipwatcher
+COPY podping-gossipwatcher /opt/podping-gossipwatcher/podping-gossipwatcher
+
+USER 1000
+
+EXPOSE 8089
+
+ENTRYPOINT ["/opt/podping-gossipwatcher/podping-gossipwatcher"]
