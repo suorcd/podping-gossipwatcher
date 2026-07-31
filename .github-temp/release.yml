@@ -1,0 +1,116 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+            platform: linux/amd64
+            cross_deps: ""
+          - target: aarch64-unknown-linux-gnu
+            name: linux-aarch64
+            platform: linux/arm64
+            cross_deps: "gcc-aarch64-linux-gnu"
+          - target: armv7-unknown-linux-gnueabihf
+            name: linux-armv7
+            platform: linux/arm/v7
+            cross_deps: "gcc-arm-linux-gnueabihf"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross-compilation deps
+        if: matrix.cross_deps != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_deps }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p podping-gossipwatcher
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          TARNAME="podping-gossipwatcher-${{ github.ref_name }}-${{ matrix.name }}.tar.gz"
+          tar czf "$TARNAME" podping-gossipwatcher
+          sha256sum "$TARNAME" > "$TARNAME.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            target/${{ matrix.target }}/release/podping-gossipwatcher
+            target/${{ matrix.target }}/release/podping-gossipwatcher-*.tar.gz
+            target/${{ matrix.target }}/release/podping-gossipwatcher-*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Gather assets
+        run: |
+          mkdir -p release-assets
+          find . -name 'podping-gossipwatcher-*.tar.gz' -o -name 'podping-gossipwatcher-*.tar.gz.sha256' | while read f; do
+            cp "$f" release-assets/
+          done
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+
+  oci:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build and push per-arch
+        run: |
+          registry="ghcr.io/${{ github.repository }}"
+          for pair in \
+            "release-linux-x86_64/podping-gossipwatcher linux/amd64 linux-amd64" \
+            "release-linux-aarch64/podping-gossipwatcher linux/arm64 linux-arm64" \
+            "release-linux-armv7/podping-gossipwatcher linux/arm/v7 linux-arm-v7"; do
+            bin_src=$(echo "$pair" | awk '{print $1}')
+            platform=$(echo "$pair" | awk '{print $2}')
+            tag_suffix=$(echo "$pair" | awk '{print $3}')
+            rm -rf oci-build
+            mkdir -p oci-build
+            cp "$bin_src" oci-build/podping-gossipwatcher
+            cp Dockerfile.release oci-build/Dockerfile
+            docker buildx build --platform "$platform" \
+              -t "${registry}:${{ steps.version.outputs.version }}-${tag_suffix}" \
+              --push oci-build/
+          done
+      - name: Create multi-arch manifest
+        run: |
+          registry="ghcr.io/${{ github.repository }}"
+          ver="${{ steps.version.outputs.version }}"
+          docker buildx imagetools create -t "${registry}:${ver}" \
+            "${registry}:${ver}-linux-amd64" \
+            "${registry}:${ver}-linux-arm64" \
+            "${registry}:${ver}-linux-arm-v7"
+          docker buildx imagetools create -t "${registry}:latest" \
+            "${registry}:${ver}-linux-amd64" \
+            "${registry}:${ver}-linux-arm64" \
+            "${registry}:${ver}-linux-arm-v7"
