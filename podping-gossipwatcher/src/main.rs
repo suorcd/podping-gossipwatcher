@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod archive;
 mod sse;
 
@@ -55,7 +58,7 @@ const RECONNECT_AFTER_FAILURES: u64 = 5;
 const RECONNECT_SHUTDOWN_TIMEOUT_SECS: u64 = 10; // Cap on old gossip actor shutdown during reconnect
 const RECONNECT_JOIN_TIMEOUT_SECS: u64 = 60;     // Cap on gossip re-join during reconnect; a hung join must not wedge the reconnect task
 const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
-const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
+const RSS_CEILING_BYTES: u64 = 512 * 1024 * 1024;
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
 const JOIN_PEERS_TIMEOUT_SECS: u64 = 10;
 
@@ -534,7 +537,7 @@ impl iroh::protocol::ProtocolHandler for ArchiveSyncHandler {
         };
 
         // Cap response to avoid OOM on very large archives
-        let payloads: Vec<_> = if payloads.len() > 50_000 {
+        let payloads: Vec<_> = if payloads.len() > 5_000 {
             println!("\x1b[33m[SYNC] Capping response at 50000 of {} messages\x1b[0m", payloads.len());
             payloads.into_iter().take(50_000).collect()
         } else {
