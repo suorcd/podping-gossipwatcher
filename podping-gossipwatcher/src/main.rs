@@ -51,8 +51,9 @@ const ISOLATION_CHECK_INTERVAL_SECS: u64 = 300; // Check for topology isolation 
 const ISOLATION_MIN_UNIQUE_PEERS: usize = 3;    // Minimum unique source peers to consider healthy
 const ENDPOINT_RESET_AFTER_RECONNECTS: u32 = 3; // Create fresh endpoint after N consecutive reconnects
 const RECONNECT_AFTER_FAILURES: u64 = 5;
-const RECONNECT_SHUTDOWN_TIMEOUT_SECS: u64 = 10; // Cap on old gossip actor shutdown during reconnect
+const RECONNECT_SHUTDOWN_TIMEOUT_SECS: u64 = 30; // Cap on old gossip actor shutdown during reconnect
 const RECONNECT_JOIN_TIMEOUT_SECS: u64 = 60;     // Cap on gossip re-join during reconnect; a hung join must not wedge the reconnect task
+const ENDPOINT_CLOSE_TIMEOUT_SECS: u64 = 10;     // Cap on old endpoint close during fresh-endpoint reset
 const PERIODIC_RESET_INTERVAL_SECS: u64 = 12 * 3600; // Recycle iroh endpoint every 12h to bound memory growth
 const RSS_CEILING_BYTES: u64 = 1024 * 1024 * 1024;   // 1 GB RSS ceiling — safety valve for endpoint recycle
 const BROADCAST_TIMEOUT_SECS: u64 = 10;
@@ -1160,15 +1161,18 @@ async fn main() -> anyhow::Result<()> {
                             .await
                         {
                             Ok(new_ep) => {
-                                // Close the old endpoint (non-blocking, best effort)
+                                // Close the old endpoint and AWAIT it so its QUIC connections
+                                // and receive buffers are actually freed. A detached close leaks
+                                // the endpoint if it outlives a short timeout. Closing it before
+                                // the gossip shutdown below also makes the actor's Disconnect
+                                // sends fail fast instead of hanging.
                                 let old_ep = _current_endpoint.clone();
-                                tokio::spawn(async move {
-                                    tokio::time::timeout(
-                                        std::time::Duration::from_secs(5),
-                                        old_ep.close(),
-                                    ).await.ok();
-                                });
                                 _current_endpoint = new_ep;
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(ENDPOINT_CLOSE_TIMEOUT_SECS),
+                                    old_ep.close(),
+                                )
+                                .await;
                                 eprintln!("\x1b[32m[RECONNECT] Fresh endpoint created successfully.\x1b[0m");
                             }
                             Err(e) => {
@@ -1179,16 +1183,25 @@ async fn main() -> anyhow::Result<()> {
                         eprintln!("\x1b[1;31m[RECONNECT] {} consecutive broadcast failures — reconnecting gossip topic (attempt {})...\x1b[0m", failures, consecutive_reconnects);
                     }
 
-                    // Shut down the old Gossip actor so all its internal dtt actors stop.
-                    // Time-capped: a hung actor must not block the reconnect (the actor is
-                    // abandoned either way once the new Gossip replaces it).
+                    // Shut down the old Gossip actor so it stops its connection loops and
+                    // frees peer/topic state. Await it so the drain actually completes; the
+                    // timeout is a safety net, not a silent discard — on timeout we log and
+                    // fall through (the handle is replaced below and the endpoint is closed,
+                    // so the actor still terminates once all handles are gone).
                     {
                         let old_gossip = reconnect_gossip_handle.read().await;
-                        let _ = tokio::time::timeout(
+                        if tokio::time::timeout(
                             std::time::Duration::from_secs(RECONNECT_SHUTDOWN_TIMEOUT_SECS),
                             old_gossip.shutdown(),
                         )
-                        .await;
+                        .await
+                        .is_err()
+                        {
+                            eprintln!(
+                                "\x1b[33m[RECONNECT] Gossip shutdown timed out after {}s; dropping handle to force cleanup\x1b[0m",
+                                RECONNECT_SHUTDOWN_TIMEOUT_SECS
+                            );
+                        }
                     }
 
                     // Spawn a fresh Gossip actor on the current endpoint
@@ -1958,6 +1971,14 @@ fn spawn_receive_task(
     tokio::spawn(async move {
         let my_node_id_str = my_node_id.to_string();
         loop {
+            // Stop promptly if a newer receive task has been spawned (reconnect happened).
+            // Checked at the top of every iteration — including the 30s-timeout path — so a
+            // stale task can't linger forever holding the old GossipReceiver and pinning the
+            // old gossip actor + endpoint in memory.
+            if receive_generation_counter.load(Ordering::Relaxed) != receive_generation {
+                println!("\x1b[33m[RECV] Stale receive task (gen {}) stopping, newer generation active.\x1b[0m", receive_generation);
+                return;
+            }
             // Use a short timeout so we can periodically check last_notification_time.
             // We can't use a long heartbeat on receiver.next() because gossip housekeeping
             // events (NeighborUp/Down, Prune) would reset it even when no real messages flow.
@@ -1981,11 +2002,6 @@ fn spawn_receive_task(
                     continue; // timeout but last_notification_time is recent — keep waiting
                 }
             };
-            // Stop processing if a newer receive task has been spawned (reconnect happened)
-            if receive_generation_counter.load(Ordering::Relaxed) != receive_generation {
-                println!("\x1b[33m[RECV] Stale receive task (gen {}) stopping, newer generation active.\x1b[0m", receive_generation);
-                return;
-            }
             match event {
                 Ok(ref ev) => {
                     match ev {
