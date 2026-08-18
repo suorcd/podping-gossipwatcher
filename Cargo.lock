@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "podping-gossipwatcher"
-version = "0.12.1-alpha.2"
+version = "0.12.2-alpha.0"
 dependencies = [
  "anyhow",
  "axum",

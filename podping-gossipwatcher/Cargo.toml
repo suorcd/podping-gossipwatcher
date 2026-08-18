@@ -1,6 +1,6 @@
 [package]
 name = "podping-gossipwatcher"
-version = "0.12.1-alpha.2"
+version = "0.12.2-alpha.0"
 authors = ["Dave Jones"]
 edition = "2021"
 
