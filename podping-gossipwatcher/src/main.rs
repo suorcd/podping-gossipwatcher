@@ -509,6 +509,20 @@ impl iroh::protocol::ProtocolHandler for ArchiveSyncHandler {
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
+        let result = self.sync_once(&connection).await;
+        // Explicitly close the connection so its QUIC receive buffer is freed
+        // now rather than orphaned until the idle timeout fires. Dropping the
+        // handle alone (the previous behavior) abandons the connection.
+        connection.close(0u32.into(), b"sync complete");
+        result
+    }
+}
+
+impl ArchiveSyncHandler {
+    async fn sync_once(
+        &self,
+        connection: &iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
         let (mut send, mut recv) = connection.accept_bi().await?;
 
         // Read 8-byte big-endian u64 since_timestamp
@@ -642,12 +656,14 @@ async fn run_catchup(
         Ok(streams) => streams,
         Err(e) => {
             eprintln!("\x1b[35m[CATCHUP] Failed to open stream: {}\x1b[0m", e);
+            conn.close(1u32.into(), b"stream open failed");
             return;
         }
     };
 
     if let Err(e) = send.write_all(&since.to_be_bytes()).await {
         eprintln!("\x1b[35m[CATCHUP] Failed to send timestamp: {}\x1b[0m", e);
+        conn.close(1u32.into(), b"write failed");
         return;
     }
     let _ = send.finish();
@@ -701,6 +717,7 @@ async fn run_catchup(
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     last_notification_time.store(now, Ordering::Relaxed);
     println!("\x1b[32m[CATCHUP] Catch-up complete: received {} notifications\x1b[0m", count);
+    conn.close(0u32.into(), b"catchup complete");
 }
 
 //Main ---------------------------------------------------------------------------------------------
